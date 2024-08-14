@@ -1,0 +1,539 @@
+function [Q,P,FAIL,iter,normR] = NonlinearIteration(input,Q,P,targetLoad,K,L,dofTotal,nodesPerElement,TOL_equilibrium,maxITER,maxMOD,QUASI_ITER,PROCMOD,FAIL,PROG,SolverOptions)
+
+PROCESS = 4;
+if SolverOptions.MIXED == 1
+    PROCESS = 5;
+end
+
+dofPerNode = size(input.ND,2)-1;
+elementType = input.EL(1,2);
+
+%% Standard + Process Modification
+
+if PROCESS == 1
+
+    % Initialise Variables for Iterative Process
+    iter = 0;
+    subiter = 1;
+    mod = 0;
+    Beta = zeros(maxMOD,1);
+    Phi0 = zeros(dofTotal,1);
+    Lambda0 = 0;
+    DeltaQ0 = zeros(dofTotal,1);
+    alpha2 = 10^-2;
+
+    % Print header for info
+    fprintf('\n      Iter  |   norm(DelQ)  |   max(Q)   |   Lambda   |   Phi_1   |  TestLam   |  TestPhi   |   norm(R)');
+
+
+    % Initial Residual = Target Load - Previous Load = deltaP
+    residual = targetLoad - P;
+    
+    % Initial Norm
+    normR = norm(residual(L))/max(targetLoad);
+    
+    while normR > TOL_equilibrium %|| norm(DeltaQ) > alpha1
+        
+        % Display iteration number in MATLAB output
+        if iter < 10;       fprintf('\n      %i',iter);
+        elseif iter < 100;  fprintf('\n     %i' ,iter);
+        elseif iter < 1000; fprintf('\n    %i'  ,iter);
+        end
+        
+        % Change in guess
+        DeltaQ = SolveQ(K,residual,L,input);
+        fprintf('         %7.2d',norm(DeltaQ));
+        
+        % Updated guess
+        Q = Q + DeltaQ';
+        
+        if PROCMOD == 1 && mod >= 1 && mod <= dofTotal
+            
+            % Calculate Improved estimate
+            for i = 1:dofTotal
+                Term = zeros(dofTotal,mod+1);
+                for m = 1:mod
+                    SumL = 0;
+                    for l = 1:dofTotal
+                        SumL = SumL + Phi(l,m)*(DeltaQ(l)+sum(Term(l,:)));
+                    end
+                    
+                    for k = 1:dofTotal
+                        Term(k,m+1) = Term(k,m+1)+Beta(m)*Phi(k,m)*SumL;
+                    end
+                end
+                Q(i) = Q(i) + sum(Term(i,:));
+            end
+            
+            
+        end
+        fprintf('       %7.2d',abs(max(Q)));
+        
+        % Calculate function and residual
+        P = SolveP(Q,input,nodesPerElement);
+        
+        residual = full(targetLoad) - P';
+        
+        normR = norm(residual(L))/max(targetLoad);
+        
+        % Potentially modify the iterative process
+        if subiter >= 2 && PROCMOD == 1
+            
+            % Calculation of Eigenvalue
+            LamTop = 0; LamBot = 0;
+            for i = 1:dofTotal
+                LamTop = LamTop + DeltaQ(i)*DeltaQ0(i);
+                LamBot = LamBot + DeltaQ0(i)*DeltaQ0(i);
+            end
+            Lambda = LamTop/LamBot;
+            if Lambda < 0;  fprintf('     %7.5f',Lambda); end
+            if Lambda >= 0; fprintf('      %7.5f',Lambda); end
+            
+            % Calculation of Eigenvector
+            PhiN = zeros(dofTotal,1);
+            for i = 1:dofTotal
+                PhiN(i) = DeltaQ0(i)/sqrt(LamBot);
+            end
+            if PhiN(L(1)) < 0; PhiN = -1.*PhiN;   end
+            fprintf('     %7.5f',PhiN(L(1)));   
+            
+            % Comparison with previous Lambda and Phi
+            TestLam = abs(Lambda-Lambda0);
+            TestOne = abs(1.0-Lambda);
+            fprintf('     %7.2e',TestLam);
+            
+            TestPhi = 0;
+            for jj = 1:dofTotal
+                TestPhi = TestPhi + abs(PhiN(jj)-Phi0(jj))^2;
+            end
+            TestPhi = sqrt(TestPhi);
+            fprintf('     %7.2e',TestPhi);
+            
+            % Modify process if convergence is satisfied
+            if (TestLam < alpha2 && TestPhi < alpha2 && TestOne > 0.01 && mod < maxMOD)
+                Beta(mod+1) = Lambda/(1-Lambda);
+                Phi(:,mod+1) = PhiN;
+                mod = mod + 1;
+                subiter = 0;
+            else
+                Lambda0 = Lambda;
+                Phi0 = PhiN; 
+            end
+            
+        else
+            fprintf('     --------     --------    --------    -------- ');
+
+        end
+        
+        fprintf('      %7.2d',normR);
+        
+        if subiter == 0; fprintf('\n      PROCESS MODIFIED'); ON = 0; end
+        DeltaQ0 = DeltaQ;
+        
+        iter = iter + 1;
+        subiter = subiter + 1;
+            
+        % End loop if convergence is not occurring
+        if iter > maxITER 
+            fprintf('\n      DID NOT CONVERGE (reached maximum number of iterations)');
+            FAIL = 1;
+            break;
+        end
+        
+        % End loop if displacements are exploding
+        if max(Q) > 10^8
+            fprintf('\n      DID NOT CONVERGE (displacements -> infinity)');
+            FAIL = 1;
+            fprintf('\n');
+            break;
+        end
+        
+    end
+
+    
+
+end
+
+%% BFGS UPDATED SECANT METHOD
+
+if PROCESS == 2
+      
+    % Invert initial stiffness matrix
+    invK0 = inv(K(L,L));
+    invK = invK0;
+    
+    % Initialise Variables for Iterative Process
+    iter = 1;
+    fprintf('\n      Iter  |   norm(DelQ)  |   max(Q)   |   norm(R)');
+
+    % Initialise storage arrays
+    DeltaQ_store = zeros(dofTotal,maxITER);
+    Residual_store = zeros(dofTotal,maxITER);
+    
+    % Initial Residual = Target Load - Previous Load = deltaP
+    residual = targetLoad - P;
+    Residual_store(:,1) = residual';
+    
+    % Initial Norm
+    normR = norm(residual(L))/max(targetLoad);
+    
+    while normR > TOL_equilibrium %|| norm(DeltaQ) > alpha1
+        
+        % Display iteration number in MATLAB output
+        if iter < 10;       fprintf('\n      %i',iter);
+        elseif iter < 100;  fprintf('\n     %i' ,iter);
+        elseif iter < 1000; fprintf('\n    %i'  ,iter);
+        end
+        
+        % Update Guess of Displacements
+        DeltaQ = zeros(1,dofTotal);
+
+        % Calculate displacements of unconstrained degrees of freedoms
+        DeltaQ_ = invK*residual(L)';
+        DeltaQ(L) = DeltaQ_;
+        DeltaQ_store(:,iter) = DeltaQ';
+        fprintf('         %7.2d',norm(DeltaQ));
+
+        % Determine improved estimate using Updated Secant Method
+        if iter > 5
+            DeltaQt = UpdateSecantStiffness(invK0,L,iter,DeltaQ_store,Residual_store);
+            DeltaQ_ = DeltaQt';
+            % Form complete displacement vector 
+            DeltaQ(L) = DeltaQ_;
+            DeltaQ_store(:,iter) = DeltaQ';
+        end 
+        
+        fprintf('         %7.2d',norm(DeltaQ));
+        
+        % Updated guess
+        Q = Q + DeltaQ';
+        
+        fprintf('       %7.2d',abs(max(Q)));
+        
+        % Calculate function and residual
+        P = SolveP(Q,input,nodesPerElement);
+        
+        residual = full(targetLoad) - P';
+        Residual_store(:,iter+1) = residual';
+        
+        normR = norm(residual(L))/max(targetLoad);
+        
+        fprintf('      %7.2d',normR);
+        
+        iter = iter + 1;
+            
+        % End loop if convergence is not occurring
+        if iter > maxITER 
+            fprintf('\n      DID NOT CONVERGE (reached maximum number of iterations)');
+            FAIL = 1;
+            break;
+        end
+        
+        % End loop if displacements are exploding
+        if max(Q) > 10^8
+            fprintf('\n      DID NOT CONVERGE (displacements -> infinity)');
+            FAIL = 1;
+            fprintf('\n');
+            break;
+        end
+        
+    end
+
+end
+
+
+%% "GOOD BROYDEN" UPDATED SECANT METHOD
+
+if PROCESS == 3
+      
+    % Invert initial stiffness matrix
+    invK = inv(K(L,L));
+    
+    % Initialise Variables for Iterative Process
+    iter = 1;
+    fprintf('\n      Iter |  norm(DelQ1) |  max(Q1)     |  norm(R1)    |  norm(DelQ2) |  max(Q2)     |  norm(R2)    ');
+    fprintf('\n      %i',iter);
+    
+    % Initial Residual = Target Load - Previous Load = deltaP
+    residual = targetLoad - P;
+    
+    DeltaQ_ = invK*residual(L)';
+    DeltaQ = zeros(1,dofTotal);
+    DeltaQ(L) = DeltaQ_;
+    fprintf('       %7.2d',norm(DeltaQ));
+
+    Q = Q + DeltaQ';
+    fprintf('       %7.2d',abs(max(Q)));
+    
+    % Calculate residual of previous estimate
+    P1 = SolveP(Q,input,nodesPerElement);
+    R1 = full(targetLoad)-P1';
+    normR = norm(R1(L))/max(targetLoad);
+    fprintf('       %7.2d',normR);
+        
+    iter = 2;
+    while normR > TOL_equilibrium %|| norm(DeltaQ) > alpha1
+        
+        % Display iteration number in MATLAB output
+        if iter < 10;       fprintf('\n      %i',iter);
+        elseif iter < 100;  fprintf('\n     %i' ,iter);
+        elseif iter < 1000; fprintf('\n    %i'  ,iter);
+        end
+        
+        % First estimate of updated displacements
+        DeltaQ1_ = invK*R1(L)';
+        
+        % Store first estimate
+        DeltaQ1 = zeros(1,dofTotal);
+        DeltaQ1(L) = DeltaQ1_;
+        fprintf('       %7.2d',norm(DeltaQ1));
+
+        % Updated guess (first estimate)
+        Q2 = Q + DeltaQ1';
+        fprintf('       %7.2d',abs(max(Q2)));
+        
+        % End loop if displacements are exploding
+        if max(Q2) > 10^6 || sum(isnan(Q2)) ~= 0
+            fprintf('\n      DID NOT CONVERGE ( initial estimate of displacements -> infinity)');
+            FAIL = 1;
+            fprintf('\n');
+            break;
+        end
+        
+        % Calculate function and residual (from first estimate)
+        P2 = SolveP(Q2,input,nodesPerElement);
+        R2 = full(targetLoad) - P2';
+        normR2 = norm(R2(L))/max(targetLoad);
+        fprintf('       %7.2d',normR2);
+        
+        % Update the inverse secant stiffness
+        yy = (R2(L)-R1(L))';
+        ss = DeltaQ1(L)';
+        
+        invK = invK + (ss-invK*yy)*(ss.'*invK)/(ss.'*invK*yy);
+        invK = -invK;
+        
+        % Improved estimate of displacements
+        DeltaQ_ = invK*R1(L)';
+        DeltaQ = zeros(1,dofTotal);
+        DeltaQ(L) = DeltaQ_;
+        fprintf('       %7.2d',norm(DeltaQ));
+        
+        Q = Q + DeltaQ';
+        fprintf('       %7.2d',abs(max(Q)));
+        
+        % End loop if displacements are exploding
+        if max(Q) > 10^6 || sum(isnan(Q)) ~= 0
+            fprintf('\n      DID NOT CONVERGE ( initial estimate of displacements -> infinity)');
+            FAIL = 1;
+            fprintf('\n');
+            break;
+        end
+        
+        % Calculate residual of previous estimate
+        P1 = SolveP(Q,input,nodesPerElement);
+        R1 = full(targetLoad)-P1';
+        normR = norm(R1(L))/max(targetLoad);
+        fprintf('       %7.2d',normR);
+        
+        iter = iter + 1;
+                    
+    end
+
+end
+
+%% Newton-Raphson Method for when Tangent Stiffness is known
+
+if PROCESS == 4
+        
+    % Initialise Variables for Iterative Process
+    iter = 1;
+    fprintf('\n      Iter  |   norm(DelQ)  |   max(Q)   |   norm(R)');
+
+    % Initial Residual = Target Load - Previous Load = deltaP
+    residual = targetLoad - P;
+    
+    % Initial Norm
+    normR = norm(residual(L))/norm(targetLoad);
+    % normR = 1;
+
+    while normR > TOL_equilibrium %&& iter > 1
+        
+        % Display iteration number in MATLAB output
+        if iter < 10;       fprintf('\n      %i',iter);
+        elseif iter < 100;  fprintf('\n     %i' ,iter);
+        elseif iter < 1000; fprintf('\n    %i'  ,iter);
+        end
+        
+        % Calculate and Invert initial stiffness matrix for next iteration
+        if iter > 1 && rem(iter,QUASI_ITER) == 0
+            K = Assemble_Tangent_Stiffness(Q,input,elementType,nodesPerElement,dofPerNode,PROG);
+        end
+        
+        % Update Guess of Displacements
+        DeltaQ = zeros(1,dofTotal);
+
+        % Calculate displacements of unconstrained degrees of freedoms
+        
+        % Future implementation: Reverse Cuthill-McKee ordering (improves
+        % linear solver)
+        
+        %L = symrcm(K);
+        
+        DeltaQ_ = K(L,L)\residual(L)';
+        DeltaQ(L) = DeltaQ_;
+        fprintf('         %7.2d',norm(DeltaQ));
+        
+        % Updated guess
+        eta = 1;
+        if SolverOptions.lineSearchOptions.use == 1
+            eta = LineSearch(residual, Q, DeltaQ, targetLoad, input, SolverOptions.lineSearchOptions);
+        end
+        Q = Q + eta*DeltaQ';
+        
+        fprintf('       %7.2d',abs(max(Q)));
+        
+        % Calculate function P and residual
+        P = SolveP(Q,input,nodesPerElement);
+        
+        residual = full(targetLoad) - P';
+        
+        normR = norm(residual(L))/norm(targetLoad(L));
+        
+        fprintf('      %7.2d',normR);
+        
+        iter = iter + 1;
+            
+        % End loop if convergence is not occurring
+        if iter > maxITER 
+            fprintf('\n      DID NOT CONVERGE (reached maximum number of iterations)');
+            FAIL = 1;
+            break;
+        end
+        
+        % End loop if displacements are exploding
+        if max(Q) > 10^8
+            fprintf('\n      DID NOT CONVERGE (displacements -> infinity)');
+            FAIL = 1;
+            fprintf('\n');
+            break;
+        end
+
+        if normR > 10^5
+            fprintf('\n      DID NOT CONVERGE (residual -> infinity)');
+            FAIL = 1;
+            fprintf('\n');
+            break;
+        end
+        
+        
+    end
+    
+end
+
+%% MIXED FINITE ELEMENT - SATISFY INCOMPRESSIBILITY AS WELL AS NEWTON SOLUTION
+
+if PROCESS == 5
+        
+    % Initialise Variables for Iterative Process
+    iter = 1;
+    fprintf('\n      Iter  |   norm(DelQ)  |   max(Q)   |   norm(R)   |   norm(H)  ');
+
+    % Initial Residual = Target Load - Previous Load = deltaP
+    residual0 = targetLoad - P;
+    Q0 = Q;
+    normH = 1;
+
+    lambdaElems = zeros(numel(input.EL(:,1)),1);
+    thetaElems = zeros(numel(input.EL(:,1)),1);
+    hElems = zeros(numel(input.EL(:,1)),1);
+    kappa = input.model(2);
+    
+    hIter = 0;
+    while normH > TOL_equilibrium
+    
+        % Initial Norm
+        residual = residual0;
+        normR = norm(residual(L))/norm(targetLoad);
+        Q = Q0;
+        hIter = hIter + 1;
+        
+        
+        % debugging
+        if hIter > 1
+            hello = 90;
+        end
+
+        while normR > TOL_equilibrium
+            
+            % Display iteration number in MATLAB output
+            if iter < 10;       fprintf('\n      %i',iter);
+            elseif iter < 100;  fprintf('\n     %i' ,iter);
+            elseif iter < 1000; fprintf('\n    %i'  ,iter);
+            end
+            
+            % Calculate and Invert initial stiffness matrix for next iteration
+            if iter > 1 && rem(iter,QUASI_ITER) == 0
+                [K, thetaElems, hElems] = Assemble_Tangent_Stiffness_MIXED(Q, input, elementType, nodesPerElement, dofPerNode ,PROG, lambdaElems, thetaElems, hElems);
+            end
+            
+            % Update Guess of Displacements
+            DeltaQ = zeros(1,dofTotal);
+    
+            % Calculate displacements of unconstrained degrees of freedoms
+            DeltaQ_ = K(L,L)\residual(L)';
+            DeltaQ(L) = DeltaQ_;
+            fprintf('         %7.2d',norm(DeltaQ));
+            
+            % Updated guess
+            eta = 1;
+            if SolverOptions.lineSearchOptions.use == 1
+                eta = LineSearch(residual, Q, DeltaQ, targetLoad, input, SolverOptions.lineSearchOptions);
+            end
+            Q = Q + eta*DeltaQ';
+            
+            fprintf('       %7.2d',abs(max(Q)));
+            
+            % Calculate function P and residual
+            P = Assemble_Load_Vector_MIXED(Q, input, dofPerNode, nodesPerElement, elementType);
+            
+            residual = full(targetLoad) - P';
+            
+            normR = norm(residual(L))/norm(targetLoad(L));
+            normH = norm(hElems);
+    
+            fprintf('      %7.2d',normR);
+            fprintf('      %7.2d',normH);
+            
+            iter = iter + 1;
+                
+            % End loop if convergence is not occurring
+            if iter > maxITER 
+                fprintf('\n      DID NOT CONVERGE (reached maximum number of iterations)');
+                FAIL = 1;
+                break;
+            end
+            
+            % End loop if displacements are exploding
+            if max(Q) > 10^8
+                fprintf('\n      DID NOT CONVERGE (displacements -> infinity)');
+                FAIL = 1;
+                fprintf('\n');
+                break;
+            end
+    
+            if normR > 10^5
+                fprintf('\n      DID NOT CONVERGE (residual -> infinity)');
+                FAIL = 1;
+                fprintf('\n');
+                break;
+            end
+            
+        end
+
+        % update lagrange multipliers
+        lambdaElems = lambdaElems + kappa.*hElems;
+
+    end
+    
+end

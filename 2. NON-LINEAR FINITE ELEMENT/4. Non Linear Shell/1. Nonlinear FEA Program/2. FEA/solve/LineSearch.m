@@ -1,0 +1,73 @@
+%% LINE SEARCH AlGORITHM
+
+% Line Search Algorithm for use in nonlinear finite element program to
+% assist convergence of Newton + quasi-Newton iterative processes
+
+% Created by Daniel J. O'Shea
+% Date: 16/07/2023
+
+
+%%
+function eta = LineSearch(residual, Q, DeltaQ, targetP, input, lineSearchOptions)
+
+rho = lineSearchOptions.tolerance;
+method = lineSearchOptions.method;
+maxSearch = lineSearchOptions.maxSearch;
+
+R0 = dot(DeltaQ,residual);
+R1 = dot(DeltaQ,Calc_Residual(targetP, Q, DeltaQ, 1, input));
+Ri = R1;
+count = 0;
+
+eta = 1;
+while abs(Ri)/abs(R0) > rho && count <= maxSearch
+    
+    count = count + 1;
+
+    if strcmp(method, "Quadratic Expansion")
+        
+        % Alpha term (see Bonet 1997)
+        alpha = R0/Ri;
+    
+        % Find new eta depending on if sqrt term yields a real value
+        if alpha < 0
+            eta = alpha/2 + sqrt((alpha/2)^2 - alpha);
+        else
+            eta = alpha / 2;
+        end
+    
+        % Update approximation for R
+        Ri = (1 - eta) * R0 + eta^2 * Ri;
+
+    elseif strcmp(method, "Interpolated Line Search")
+
+        Ri = dot(DeltaQ,Calc_Residual(targetP, Q, DeltaQ, eta, input));
+
+        eta = eta * R0 / (R0 - Ri);
+
+    elseif strcmp(method, "Regula Falsi")
+        
+        eta = etaU;
+        Ri = dot(DeltaQ,Calc_Residual(targetP, Q, DeltaQ, eta, input));
+
+        eta = eta * R0 / (R0 - Ri);
+
+
+    end
+
+end
+
+end
+
+
+% Calculate residual for given 
+function Res = Calc_Residual(targetP, Q, DeltaQ, eta, input)
+
+if input.EL(1,2) == 2 || input.EL(1,2) == 4; ndsPerElem = 8; end
+if input.EL(1,2) == 1; ndsPerElem = 4; end
+
+Qi = Q + eta*DeltaQ;
+
+Res = full(targetP) - SolveP(Qi, input, ndsPerElem).';
+
+end
